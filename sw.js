@@ -1,5 +1,5 @@
 // Offline support. Bump CACHE when you change any file so phones pick up the new version.
-const CACHE = 'wallets-v1';
+const CACHE = 'wallets-v2';
 const FILES = ['./', 'index.html', 'app.css', 'app.js', 'jsqr.js', 'manifest.webmanifest', 'icon-192.png', 'icon-512.png'];
 
 self.addEventListener('install', e => {

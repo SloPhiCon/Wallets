@@ -5,7 +5,7 @@
      3. Screens             Wallets (home), Pay, Refresh, History
      4. Sheets              the pop-up forms
      5. UPI + QR            building payment links, scanning
-     6. Screenshot reader   Gemini call
+     6. Screenshot reader   on-device OCR (Tesseract) + rules that pick out transactions
      7. Settings + backup
      8. Wiring              clicks, tabs, startup
    All money is stored in paise (integers) to avoid rounding errors. */
@@ -32,7 +32,7 @@ const blank = () => ({
   wallets: [],        // { id, name, color, bal }
   tx: [],             // newest first; see addTx / moveMoney / setBank for shapes
   pending: [],        // payments handed to a UPI app, waiting for "Paid / Not paid"
-  settings: { geminiKey: '', geminiModel: 'gemini-flash-latest' },
+  settings: {},
 });
 
 let S = blank();
@@ -41,6 +41,7 @@ function load() {
     const raw = localStorage.getItem(STORE_KEY);
     if (raw) S = Object.assign(blank(), JSON.parse(raw));
     S.settings = Object.assign(blank().settings, S.settings);
+    delete S.settings.geminiKey; delete S.settings.geminiModel;   // left over from the old Gemini reader
   } catch (e) { console.warn('Could not read saved data', e); }
 }
 function save() {
@@ -624,11 +625,14 @@ async function startScan() {
 }
 function stopScan() { if (scanStream) { scanStream.getTracks().forEach(t => t.stop()); scanStream = null; } }
 
-function fileToCanvas(file, maxSide) {
+/* Draws an image file on a canvas, shrunk so its longest side is at most maxSide,
+   or enlarged (within maxSide) so it is at least minWidth wide. */
+function fileToCanvas(file, maxSide, minWidth = 0) {
   return new Promise((resolve, reject) => {
     const img = new Image(), url = URL.createObjectURL(file);
     img.onload = () => {
-      const s = Math.min(maxSide / Math.max(img.width, img.height), 1);
+      const cap = maxSide / Math.max(img.width, img.height);
+      const s = Math.min(Math.max(1, minWidth / img.width), cap);
       const cv = document.createElement('canvas');
       cv.width = Math.round(img.width * s); cv.height = Math.round(img.height * s);
       cv.getContext('2d', { willReadFrequently: true }).drawImage(img, 0, 0, cv.width, cv.height);
@@ -649,47 +653,252 @@ async function qrFromFile(file) {
   } catch (e) { toast(e.message); }
 }
 
-/* ===== 6. Screenshot reader (Gemini) ===== */
-const IMPORT_PROMPT = `These images are screenshots of an Indian bank passbook, bank statement, or a UPI app's transaction history.
-List every completed money transaction you can read. Ignore failed, pending or declined ones, and ignore balance lines.
-Reply with only a JSON array. Each item: {"date":"YYYY-MM-DD","amount":number in rupees,"type":"debit" or "credit","party":"who it was paid to or received from"}.
-"debit" means money left the account holder's account; "credit" means money came in. If the year is not shown, use ${new Date().getFullYear()}. If nothing is readable, reply [].`;
+/* ===== 6. Screenshot reader (on-device OCR) =====
+   Screenshots are read on the phone by Tesseract (open-source OCR). Nothing is uploaded.
+   The reader (a few MB) is downloaded from a CDN the first time it is used; the browser keeps it after that.
+   OCR only gives text, so the rules below turn that text into transactions. Two layouts are understood:
+     - UPI app history (GPay, PhonePe, Paytm, BHIM): "Paid to X  ₹250", "Received from Y  +₹500", date nearby
+     - Bank passbook / statement rows: "10/11/2026  UPI/DR/…/NAME/…  250.00  12,345.67"
+   You check and can fix every item before it is added. */
+const TESSERACT_URL = 'https://cdn.jsdelivr.net/npm/tesseract.js@5.1.1/dist/tesseract.min.js';
+let ocrWorker = null, ocrLog = null;
 
-async function readScreenshots(files) {
-  const parts = [{ text: IMPORT_PROMPT }];
-  for (const f of files) {
-    const cv = await fileToCanvas(f, 1600);
-    parts.push({ inline_data: { mime_type: 'image/jpeg', data: cv.toDataURL('image/jpeg', 0.85).split(',')[1] } });
-  }
-  const model = (S.settings.geminiModel || 'gemini-flash-latest').trim();
-  const r = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:generateContent`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json', 'x-goog-api-key': S.settings.geminiKey.trim() },
-    body: JSON.stringify({ contents: [{ parts }], generationConfig: { responseMimeType: 'application/json', temperature: 0 } }),
+function loadScript(src) {
+  return new Promise((resolve, reject) => {
+    const s = document.createElement('script');
+    s.src = src; s.onload = resolve;
+    s.onerror = () => { s.remove(); reject(new Error('The screenshot reader could not be downloaded. Connect to the internet and try again.')); };
+    document.head.appendChild(s);
   });
-  const j = await r.json().catch(() => ({}));
-  if (!r.ok) throw new Error((j.error && j.error.message) || `Gemini replied with error ${r.status}.`);
-  const text = ((j.candidates && j.candidates[0] && j.candidates[0].content && j.candidates[0].content.parts) || []).map(p => p.text || '').join('');
-  let arr;
-  try { arr = JSON.parse(text.replace(/^```(?:json)?\s*|\s*```$/g, '')); } catch (e) { throw new Error('Gemini sent back something that was not a list of transactions. Try again.'); }
-  if (!Array.isArray(arr)) arr = arr && Array.isArray(arr.transactions) ? arr.transactions : [];
-  return arr.map(x => {
-    const amt = parseAmt(String(Math.abs(Number(x.amount))));
-    const ts = Date.parse(x.date);
-    return amt == null ? null : { amt, type: String(x.type).toLowerCase() === 'credit' ? 'credit' : 'debit', who: String(x.party || '').slice(0, 40), ts: isFinite(ts) ? ts + 12 * 3600e3 : Date.now() };
+}
+async function getOcrWorker() {
+  if (ocrWorker) return ocrWorker;
+  if (!window.Tesseract) await loadScript(TESSERACT_URL);
+  ocrWorker = await Tesseract.createWorker('eng', 1, { logger: m => ocrLog && ocrLog(m) });
+  await ocrWorker.setParameters({ preserve_interword_spaces: '1' });
+  return ocrWorker;
+}
+function stopOcr() { if (ocrWorker) { ocrWorker.terminate().catch(() => {}); ocrWorker = null; } }
+
+/* Grey, and turned to dark-on-light if the screenshot is in dark mode (Tesseract reads that much better). */
+function prepForOcr(cv) {
+  const ctx = cv.getContext('2d', { willReadFrequently: true });
+  const im = ctx.getImageData(0, 0, cv.width, cv.height), d = im.data;
+  let sum = 0;
+  for (let i = 0; i < d.length; i += 4) { const y = (d[i] * 299 + d[i + 1] * 587 + d[i + 2] * 114) / 1000; d[i] = y; sum += y; }
+  const invert = sum / (d.length / 4) < 110;
+  for (let i = 0; i < d.length; i += 4) { const y = invert ? 255 - d[i] : d[i]; d[i] = d[i + 1] = d[i + 2] = y; }
+  ctx.putImageData(im, 0, 0);
+  return cv;
+}
+
+/* OCR one image and return its text as screen rows (words at the same height joined left to right),
+   so a name on the left and its amount on the right end up on one line. */
+async function ocrRows(file) {
+  const cv = prepForOcr(await fileToCanvas(file, 2600, 1100));
+  const { data } = await (await getOcrWorker()).recognize(cv);
+  const words = (data.words || []).filter(w => w.text && w.text.trim());
+  if (!words.length) return (data.text || '').split('\n').map(s => s.trim()).filter(Boolean);
+  words.sort((a, b) => (a.bbox.y0 + a.bbox.y1) - (b.bbox.y0 + b.bbox.y1));
+  const rows = [];
+  for (const w of words) {
+    const cy = (w.bbox.y0 + w.bbox.y1) / 2, h = w.bbox.y1 - w.bbox.y0, r = rows[rows.length - 1];
+    if (r && Math.abs(cy - r.cy) < Math.max(h, r.h) * 0.5) { r.words.push(w); r.h = Math.max(r.h, h); }
+    else rows.push({ cy, h, words: [w] });
+  }
+  return rows.map(r => r.words.sort((a, b) => a.bbox.x0 - b.bbox.x0).map(w => w.text).join(' ').replace(/[−–—]/g, '-').replace(/\s+/g, ' ').trim());
+}
+
+/* --- dates --- */
+const MONTHS = { jan: 0, feb: 1, mar: 2, apr: 3, may: 4, jun: 5, jul: 6, aug: 7, sep: 8, oct: 9, nov: 10, dec: 11 };
+const MON = '(jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|june?|july?|aug(?:ust)?|sep(?:t(?:ember)?)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?)(?![a-z])\\.?';
+const DATE_RES = [
+  [/\b(\d{4})-(\d{1,2})-(\d{1,2})(?!\d)/i, m => [m[3], m[2] - 1, m[1]]],
+  [/\b(\d{1,2})[\/\-.](\d{1,2})[\/\-.](\d{4}|\d{2})(?!\d)/i, m => [m[1], m[2] - 1, m[3]]],
+  [new RegExp(`\\b(\\d{1,2})(?:st|nd|rd|th)?[\\s\\-]*${MON}(?:[\\s,\\-']*(\\d{4}|\\d{2}(?![\\d:])))?`, 'i'), m => [m[1], MONTHS[m[2].slice(0, 3).toLowerCase()], m[3]]],
+  [new RegExp(`\\b${MON}[\\s\\-]*(\\d{1,2})(?:st|nd|rd|th)?(?!\\d)(?:,?\\s*(\\d{4}))?`, 'i'), m => [m[2], MONTHS[m[1].slice(0, 3).toLowerCase()], m[3]]],
+];
+const noon = t => { const d = new Date(t); d.setHours(12, 0, 0, 0); return d.getTime(); };
+/* First date in a line, as { ts (noon that day), i (where it starts) }, or null. Day comes before month, Indian style. */
+function findDate(s, now) {
+  for (const [re, pick] of DATE_RES) {
+    const m = re.exec(s); if (!m) continue;
+    let [d, mo, y] = pick(m); d = +d;
+    const noYear = !y;
+    y = noYear ? new Date(now).getFullYear() : (+y < 100 ? 2000 + +y : +y);
+    let dt = new Date(y, mo, d, 12);
+    if (dt.getMonth() !== mo || dt.getDate() !== d || y < 2000) continue;
+    if (noYear && dt.getTime() > now + 2 * 864e5) dt = new Date(y - 1, mo, d, 12);
+    return { ts: dt.getTime(), i: m.index };
+  }
+  if (/\btoday\b/i.test(s)) return { ts: noon(now), i: s.search(/\btoday\b/i) };
+  if (/\byesterday\b/i.test(s)) return { ts: noon(now - 864e5), i: s.search(/\byesterday\b/i) };
+  return null;
+}
+/* Removes dates, times, masked account numbers and long reference numbers, so they are never taken for amounts. */
+function stripNoise(s) {
+  for (const [re] of DATE_RES) s = s.replace(new RegExp(re.source, 'gi'), ' ');
+  return s.replace(/\b\d{1,2}:\d{2}(?::\d{2})?\s*(?:am|pm)?/gi, ' ')
+          .replace(/(?:[x*•]{2,}|\ba\/c\s*(?:no\.?)?)\s*\d{2,}/gi, ' ')
+          .replace(/\b\d{9,}\b/g, ' ');
+}
+
+/* --- amounts and direction --- */
+const NUM = '(\\d{1,3}(?:,\\d{2,3})+(?:\\.\\d{1,2})?|\\d{1,7}(?:\\.\\d{1,2})?)';
+// The rupee sign is often read as % = & ? or similar, so those count as a rupee sign too.
+const RE_MARKED = new RegExp(`([+-]?)\\s*(?:₹|\\brs\\.?|\\binr|[%=&?¥€£$])\\s*([+-]?)\\s*${NUM}(?![\\d,])`, 'gi');
+const RE_SIGNED_END = new RegExp(`(?:^|\\s)([+-])\\s?${NUM}\\s*(?:cr|dr)?\\.?$`, 'i');
+const RE_BARE_END = new RegExp(`(?:^|\\s)${NUM}\\s*(?:cr|dr)?\\.?$`, 'i');
+const RE_BAL = /\b(balance|bal|avl|available|closing|opening)\b/i;
+const RE_FAIL = /\b(failed|declined|pending|processing|cancell?ed|unsuccessful|expired|in progress)\b/i;
+
+/* 'credit', 'debit' or null, from the words in a line. Specific phrases win over single words. */
+function kind(s) {
+  if (/received from|credited to|money received|refund|cashback/i.test(s)) return 'credit';
+  if (/paid to|sent to|debited from|payment to|money sent|transferred to/i.test(s)) return 'debit';
+  if (/\b(received|credited|reversed|reversal|deposit(?:ed)?|added|cr)\b/i.test(s)) return 'credit';
+  if (/\b(paid|sent|debited|debit|payment|purchase|withdrawn|withdrawal|spent|transferred|dr)\b/i.test(s)) return 'debit';
+  return null;
+}
+/* The amount on an app-history row, as { amt (paise), sign }, or null. */
+function rowAmount(row) {
+  if (RE_BAL.test(row)) return null;
+  const s = stripNoise(row).trim();
+  let last = null, m;
+  for (m of s.matchAll(RE_MARKED)) last = m;
+  if (last) return { amt: parseAmt(last[3]), sign: last[1] || last[2] };
+  if ((m = RE_SIGNED_END.exec(s))) return { amt: parseAmt(m[2]), sign: m[1] };
+  if (kind(row) && (m = RE_BARE_END.exec(s))) return { amt: parseAmt(m[1]), sign: '' };
+  return null;
+}
+
+/* --- who --- */
+const RE_PARTY = /\b(?:paid to|sent to|payment to|transferred to|transfer to|received from|credited by|from|to)\s*:?\s+(.+)/i;
+function cleanParty(s) {
+  s = stripNoise(s).replace(RE_MARKED, ' ').replace(/(^|\s)[+-]?\d[\d,.]*(?=\s|$)/g, ' ').replace(/\s+/g, ' ').trim();
+  let prev;
+  do {
+    prev = s;
+    s = s.replace(/^(?:[^a-z0-9]+|(?:paid|sent|received|money|payment|transfer(?:red)?|to|from|by|upi)\b)\s*/i, '')
+         .replace(/\s*(?:[^a-z0-9)]+|\b(?:paid|received|successful(?:ly)?|completed|success|debited|credited|from|to|cr|dr))$/i, '');
+  } while (s !== prev);
+  return /[a-z]{2,}/i.test(s) ? s.slice(0, 40) : '';
+}
+function partyFrom(own, near) {
+  const viaPhrase = r => { const m = RE_PARTY.exec(r); return m ? cleanParty(m[1]) : ''; };
+  return viaPhrase(own) || cleanParty(own) || near.map(viaPhrase).find(Boolean) || near.map(cleanParty).find(Boolean) || '';
+}
+
+/* UPI app history: every row with an amount is one transaction; its date and status sit just above or below it. */
+function parseAppRows(rows, now) {
+  const am = rows.map(rowAmount);
+  const idx = am.map((a, i) => (a && a.amt ? i : -1)).filter(i => i >= 0);
+  const span = k => [k ? idx[k - 1] : -1, idx[k + 1] ?? rows.length];
+  const informative = r => findDate(r, now) || kind(r);
+  // Do the detail lines sit below the amount row (most apps) or above it?
+  let below = 0, above = 0;
+  idx.forEach((i, k) => {
+    const [prev, next] = span(k);
+    if (rows.slice(i + 1, Math.min(next, i + 3)).some(informative)) below++;
+    if (rows.slice(Math.max(prev + 1, i - 2), i).some(informative)) above++;
+  });
+  const down = below >= above;
+  // Some apps group the list under day headers ("Today", "10 November"). A header is a line with only a date
+  // (no time). If one sits above the first item, headers belong to the items below them, not the one above.
+  const isHeader = r => !/\d:\d{2}/.test(r) && findDate(r, now) && !/[a-z0-9]/i.test(stripNoise(r).replace(/\b(today|yesterday)\b/gi, ''));
+  const headers = idx.length > 0 && rows.slice(0, idx[0]).some(isHeader);
+  const out = [];
+  let carry = null;   // last date seen higher up, for lists that only show a date header per day
+  idx.forEach((i, k) => {
+    const [prev, next] = span(k);
+    const near = (down ? rows.slice(i + 1, Math.min(next, i + 4)) : rows.slice(Math.max(prev + 1, i - 3), i).reverse())
+      .filter(r => !(headers && isHeader(r)));
+    const group = [rows[i], ...near];
+    for (const r of rows.slice(prev + 1, i)) { const d = findDate(r, now); if (d) carry = d.ts; }
+    if (group.some(r => RE_FAIL.test(r))) return;
+    const a = am[i];
+    const type = a.sign === '+' ? 'credit' : a.sign === '-' ? 'debit' : (group.map(kind).find(Boolean) || 'debit');
+    const d = group.map(r => findDate(r, now)).find(Boolean);
+    const ts = d ? d.ts : (carry ?? noon(now));
+    if (d) carry = d.ts;
+    out.push({ amt: a.amt, type, who: partyFrom(rows[i], near), ts });
+  });
+  return out;
+}
+
+/* Bank passbook / statement: each row starts with a date and ends with amount then balance.
+   Money out or in is worked out from how the balance changes between rows, falling back to Dr/Cr words. */
+const RE_DEC = /(\d{1,3}(?:,\d{2,3})+|\d+)\.\d{2}(?!\d)(?:\s*(cr|dr)\b)?/gi;
+const STMT_NOISE = /^(upi|dr|cr|imps|neft|rtgs|p2a|p2m|ach|nach|mb|ib|ref|txn|payment|transfer|trf|to|by|ybl|paytm|.*@.*)$/i;
+const isStatementRow = (r, now) => { const d = findDate(r, now); return d && d.i <= 3 && (stripNoise(r).match(RE_DEC) || []).length >= 2; };
+function parseStatementRows(rows, now) {
+  const recs = [];
+  for (const r of rows) {
+    const d = findDate(r, now);
+    if (d && d.i <= 3) recs.push({ ts: d.ts, first: r, desc: r, extra: 0 });
+    else if (recs.length && recs[recs.length - 1].extra < 2 && !/\d\.\d{2}(?!\d)/.test(stripNoise(r))) { const x = recs[recs.length - 1]; x.desc += ' ' + r; x.extra++; }
+  }
+  const parsed = recs.map(x => {
+    if (/opening|closing|b\/f|brought forward|c\/f|carried forward|\btotal\b/i.test(x.desc)) return null;
+    const s = stripNoise(x.first), nums = [...s.matchAll(RE_DEC)];
+    if (!nums.length) return null;
+    const a = nums.length >= 2 ? nums[nums.length - 2] : nums[0];
+    return { ts: x.ts, amt: parseAmt(a[0].replace(/\s*(cr|dr)$/i, '')), mark: (a[2] || '').toLowerCase(),
+             bal: nums.length >= 2 ? parseAmt(nums[nums.length - 1][0].replace(/\s*(cr|dr)$/i, '')) : null,
+             words: stripNoise(x.desc).replace(RE_DEC, ' '), desc: x.desc.replace(RE_DEC, ' ') };
+  });
+  return parsed.map((x, i) => {
+    if (!x || !x.amt) return null;
+    let type = null;
+    for (const o of [parsed[i - 1], parsed[i + 1]]) {   // the older row could be above or below
+      if (type || !o || x.bal == null || o.bal == null) continue;
+      if (Math.abs(o.bal - x.amt - x.bal) <= 1) type = 'debit';
+      else if (Math.abs(o.bal + x.amt - x.bal) <= 1) type = 'credit';
+    }
+    if (!type && x.mark) type = x.mark === 'cr' ? 'credit' : 'debit';
+    if (!type) type = /\/cr\/|\bby\s+(transfer|trf|clg|cash)|\bcredit|\bdep(osit)?\b|interest/i.test(x.words) ? 'credit' : /\/dr\/|\bto\s+(transfer|trf|clg|cash)|\bdebit|\bwdl\b|withdrawal|\bdr\b/i.test(x.words) ? 'debit' : (kind(x.words) || 'debit');
+    const segs = stripNoise(x.desc).split(/[\/|-]/).map(t => t.trim());
+    const seg = segs.length > 2 ? segs.find(t => /[a-z]{3,}/i.test(t) && !STMT_NOISE.test(t)) : null;
+    return { amt: x.amt, type, who: cleanParty(seg || x.desc.replace(/\b(upi|imps|neft|rtgs|by|to|transfer|trf)\b/gi, ' ')), ts: x.ts };
   }).filter(Boolean);
+}
+
+function parseTransactions(rows, now = Date.now()) {
+  const statement = rows.filter(r => isStatementRow(r, now)).length >= 2;
+  return (statement ? parseStatementRows : parseAppRows)(rows, now).filter(t => t.amt > 0 && t.amt < 1e10);
+}
+
+/* Reads every picked screenshot. Returns { items, text } (text = what OCR saw, shown if nothing was found). */
+async function readScreenshots(files, onStatus) {
+  const items = [], seen = new Set(), texts = [];
+  try {
+    for (let n = 0; n < files.length; n++) {
+      const label = files.length > 1 ? ` ${n + 1} of ${files.length}` : '';
+      ocrLog = m => {
+        if (m.status === 'recognizing text') onStatus(`Reading${label}… ${Math.round((m.progress || 0) * 100)}%`);
+        else if (/load|initializ/i.test(m.status)) onStatus('Getting the reader ready…');
+      };
+      onStatus(`Reading${label}…`);
+      const rows = await ocrRows(files[n]);
+      texts.push(rows.join('\n'));
+      for (const t of parseTransactions(rows)) {   // the same transaction can show on two overlapping screenshots
+        const key = [t.type, t.amt, new Date(t.ts).toDateString(), t.who.toLowerCase()].join('|');
+        if (!seen.has(key)) { seen.add(key); items.push(t); }
+      }
+    }
+  } finally { ocrLog = null; stopOcr(); }
+  return { items, text: texts.join('\n\n---\n\n') };
 }
 /* True when the app already has a transaction with the same amount and direction within a day. */
 const alreadyRecorded = it => S.tx.some(t => t.type === it.type && t.amt === it.amt && Math.abs(t.ts - it.ts) < 36 * 3600e3);
 
+const ymd = ts => { const d = new Date(ts); return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`; };
+
 let importItems = [];
 function openImport() {
-  if (!S.settings.geminiKey.trim()) {
-    return openSheet(`<h3>Read a screenshot</h3><p class="lede">This uses Google's Gemini to read transactions from a screenshot of your UPI app or e-passbook. It needs a free API key first.</p>
-      <button class="btn primary wide" data-act="sheetSettings">Add the key in Settings</button>`);
-  }
-  openSheet(`<h3>Read a screenshot</h3><p class="lede">Pick screenshots of your UPI app history or e-passbook. They are sent to Google Gemini to be read.</p>
+  openSheet(`<h3>Read a screenshot</h3><p class="lede">Pick screenshots of your UPI app history or e-passbook. They are read on this phone and never uploaded. You can fix anything it gets wrong before adding.</p>
     <label class="field"><span>Screenshots</span><input type="file" id="imp-files" accept="image/*" multiple></label>
+    <p class="hint">The first time, the reader (a few MB) is downloaded, so you need internet once.</p>
     <p class="err" hidden></p><button class="btn primary wide" data-act="doImportRead">Read transactions</button>`);
 }
 actions.doImportRead = async (d, el) => {
@@ -697,31 +906,42 @@ actions.doImportRead = async (d, el) => {
   if (!files.length) return sheetErr('Pick at least one screenshot.');
   el.disabled = true; el.textContent = 'Reading…';
   try {
-    importItems = await readScreenshots(files);
-    showImportList();
-  } catch (e) { el.disabled = false; el.textContent = 'Read transactions'; sheetErr(e.message || 'Could not reach Gemini. Check your internet connection.'); }
+    const r = await readScreenshots(files, msg => { el.textContent = msg; });
+    importItems = r.items;
+    showImportList(r.text);
+  } catch (e) { el.disabled = false; el.textContent = 'Read transactions'; sheetErr(e.message || 'The screenshot could not be read. Try again.'); }
 };
-function showImportList() {
-  if (!importItems.length) return openSheet(`<h3>No transactions found</h3><p class="lede">Nothing readable in those screenshots. Try a clearer one, or add the transactions by hand.</p><button class="btn wide" data-act="closeSheet">Close</button>`);
+function showImportList(ocrText) {
+  if (!importItems.length) return openSheet(`<h3>No transactions found</h3><p class="lede">No amounts could be picked out of those screenshots. Try a sharper one cropped to the transaction list, or add the transactions by hand.</p>
+    ${ocrText ? `<details class="ocr-text"><summary>Text the reader saw</summary><pre>${esc(ocrText)}</pre></details>` : ''}
+    <button class="btn wide" data-act="closeSheet">Close</button>`);
   const first = S.wallets[0] ? S.wallets[0].id : '';
-  let h = `<h3>${importItems.length} transaction${importItems.length > 1 ? 's' : ''} found</h3><p class="lede">Tick the ones to add and pick a wallet for each. These are already part of your bank balance, so only the wallets change.</p>`;
+  let h = `<h3>${importItems.length} transaction${importItems.length > 1 ? 's' : ''} found</h3><p class="lede">Check each one, fix anything misread, tick the ones to add and pick a wallet. These are already part of your bank balance, so only the wallets change.</p>`;
   importItems.forEach((it, i) => {
-    const dup = alreadyRecorded(it);
+    const dup = alreadyRecorded(it), credit = it.type === 'credit';
     h += `<div class="imp"><div class="imp-head"><input type="checkbox" class="check" id="imp-c${i}" ${dup ? '' : 'checked'} aria-label="Add this transaction">
-      <span class="grow"><b>${esc(it.who || (it.type === 'credit' ? 'Money received' : 'Payment'))}</b><br><span class="muted small">${new Date(it.ts).toLocaleDateString('en-IN', { day: 'numeric', month: 'short' })}${dup ? ', looks already recorded' : ''}</span></span>
-      <b class="num ${it.type === 'credit' ? 'good' : ''}">${it.type === 'credit' ? '+' : '−'}${money(it.amt)}</b></div>
-      <select id="imp-w${i}" aria-label="Wallet">${walletOptions(it.type === 'credit' ? '' : first, { balances: false })}</select></div>`;
+        <input id="imp-p${i}" maxlength="40" value="${esc(it.who)}" placeholder="Who or what" aria-label="Who or what"></div>
+      <div class="imp-row"><select id="imp-t${i}" aria-label="Money out or in"><option value="debit">Money out</option><option value="credit"${credit ? ' selected' : ''}>Money in</option></select>
+        <input id="imp-a${i}" class="num" inputmode="decimal" autocomplete="off" value="${(it.amt / 100).toFixed(2).replace(/\.00$/, '')}" aria-label="Amount in rupees"></div>
+      <div class="imp-row"><input id="imp-d${i}" type="date" value="${ymd(it.ts)}" aria-label="Date">
+        <select id="imp-w${i}" aria-label="Wallet">${walletOptions(credit ? '' : first, { balances: false })}</select></div>
+      ${dup ? '<p class="hint">Looks already recorded</p>' : ''}</div>`;
   });
-  openSheet(h + `<button class="btn primary wide" data-act="doImportAdd" style="margin-top:8px">Add ticked transactions</button>`);
+  openSheet(h + `<p class="err" hidden></p><button class="btn primary wide" data-act="doImportAdd" style="margin-top:8px">Add ticked transactions</button>`);
   importItems.forEach((it, i) => { if (it.type === 'credit') $('#imp-w' + i).value = ''; });
 }
 actions.doImportAdd = () => {
+  const picked = [];
+  for (let i = 0; i < importItems.length; i++) {
+    if (!$('#imp-c' + i).checked) continue;
+    const amt = parseAmt($('#imp-a' + i).value);
+    if (amt == null) return sheetErr(`Item ${i + 1}: enter the amount as a number, like 250.`);
+    const [y, m, d] = ($('#imp-d' + i).value || '').split('-').map(Number);
+    const ts = y ? new Date(y, m - 1, d, 12).getTime() : importItems[i].ts;
+    picked.push({ type: $('#imp-t' + i).value, amt, walletId: $('#imp-w' + i).value || null, who: $('#imp-p' + i).value.trim(), ts });
+  }
   let n = 0;
-  importItems.forEach((it, i) => {
-    if (!$('#imp-c' + i).checked) return;
-    addTx({ type: it.type, amt: it.amt, walletId: $('#imp-w' + i).value || null, who: it.who, src: 'import', live: false, ts: it.ts });
-    n++;
-  });
+  for (const p of picked) { addTx({ ...p, src: 'import', live: false }); n++; }
   S.tx.sort((a, b) => b.ts - a.ts); save();
   importItems = []; closeSheet(); render(); toast(`${n} transaction${n === 1 ? '' : 's'} added`);
 };
@@ -729,21 +949,15 @@ actions.doImportAdd = () => {
 /* ===== 7. Settings + backup ===== */
 function openSettings() {
   openSheet(`<h3>Settings</h3>
-    <h2 class="muted" style="font-size:15px;margin:14px 0 8px">Screenshot reading</h2>
-    <label class="field"><span>Gemini API key (free from aistudio.google.com)</span><input id="s-key" type="password" autocomplete="off" value="${esc(S.settings.geminiKey)}"></label>
-    <label class="field"><span>Gemini model</span><input id="s-model" autocapitalize="none" autocomplete="off" value="${esc(S.settings.geminiModel)}"></label>
-    <p class="hint">The key stays on this phone. Screenshots you choose to read are sent to Google.</p>
-    <button class="btn primary wide" data-act="doSaveSettings">Save settings</button>
-    <h2 class="muted" style="font-size:15px;margin:22px 0 8px">Your data</h2>
+    <h2 class="muted" style="font-size:15px;margin:14px 0 8px">Your data</h2>
     <p class="hint" style="margin-top:0">Everything is stored only on this phone. Save a backup file now and then.</p>
     <div class="btn-row" style="margin-bottom:10px"><button class="btn" data-act="doExport">Save backup</button><button class="btn" data-act="doImportBackup">Restore backup</button></div>
     <button class="btn danger wide" data-act="sheetErase">Erase everything</button>
     <input type="file" id="s-file" accept="application/json,.json" hidden>`);
 }
 Object.assign(actions, {
-  doSaveSettings() { S.settings.geminiKey = $('#s-key').value.trim(); S.settings.geminiModel = $('#s-model').value.trim() || 'gemini-flash-latest'; save(); closeSheet(); toast('Settings saved'); },
   doExport() {
-    const copy = JSON.parse(JSON.stringify(S)); copy.settings.geminiKey = '';   // never put the key in a backup file
+    const copy = JSON.parse(JSON.stringify(S));
     const a = document.createElement('a');
     a.href = URL.createObjectURL(new Blob([JSON.stringify(copy, null, 2)], { type: 'application/json' }));
     a.download = `wallets-backup-${new Date().toISOString().slice(0, 10)}.json`;
@@ -761,8 +975,8 @@ async function restoreBackup(file) {
   try {
     const d = JSON.parse(await file.text());
     if (!d || d.v !== 1 || !Array.isArray(d.wallets) || !Array.isArray(d.tx) || typeof d.bank !== 'number') throw new Error('bad');
-    const key = S.settings.geminiKey;
-    S = Object.assign(blank(), d); S.settings = Object.assign(blank().settings, d.settings); S.settings.geminiKey = key;
+    S = Object.assign(blank(), d); S.settings = Object.assign(blank().settings, d.settings);
+    delete S.settings.geminiKey; delete S.settings.geminiModel;
     save(); closeSheet(); tab = 'home'; render(); toast('Backup restored');
   } catch (e) { toast('That file is not a Wallets backup'); }
 }

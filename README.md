@@ -30,10 +30,12 @@ GitHub Pages gives you one for free.
   add the missing transactions by hand or read them from a screenshot, and pick a wallet
   for each. Anything you don't explain sits in Unallocated.
 - **History**: tap an entry to change its wallet or delete it (deleting undoes it).
-- **Settings** (gear on the Wallets tab): Gemini key for screenshot reading, backup, restore.
+- **Settings** (gear on the Wallets tab): backup, restore, erase.
 
-Screenshot reading needs a free Gemini API key from aistudio.google.com. Paste it in
-Settings. Screenshots you pick are sent to Google to be read.
+Screenshot reading runs on the phone with Tesseract (open-source OCR); screenshots are
+never uploaded and no API key is needed. The first time you use it, the reader (a few MB)
+is downloaded from cdn.jsdelivr.net, so you need internet once. Every transaction it finds
+can be corrected before it is added.
 
 ## Where to change things
 
@@ -45,7 +47,7 @@ Settings. Screenshots you pick are sent to Google to be read.
 | Screens (Wallets, Pay, Refresh, History) | `app.js` section 3 |
 | Pop-up forms and what their buttons do | `app.js` section 4 |
 | UPI link building and QR scanning | `app.js` section 5 |
-| The instructions given to Gemini | `app.js` section 6, `IMPORT_PROMPT` |
+| How screenshot text becomes transactions | `app.js` section 6 (`parseAppRows`, `parseStatementRows`) |
 | App name and icon | `manifest.webmanifest`, `icon-192.png`, `icon-512.png` |
 
 After changing any file, upload it to GitHub again and bump `wallets-v1` to `wallets-v2`
