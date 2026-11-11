@@ -1,0 +1,32 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Wallets</title>
+<meta name="theme-color" content="#1B2559">
+<link rel="manifest" href="manifest.webmanifest">
+<link rel="icon" href="icon-192.png">
+<link rel="apple-touch-icon" href="icon-192.png">
+<link rel="stylesheet" href="app.css">
+</head>
+<body>
+<main id="view" aria-live="polite"></main>
+
+<nav id="tabs" aria-label="Sections">
+  <button data-tab="home"><svg viewBox="0 0 24 24"><path d="M3 7h18v12H3zM3 7l2-3h14l2 3M15 13h3"/></svg><span>Wallets</span></button>
+  <button data-tab="pay"><svg viewBox="0 0 24 24"><path d="M4 4h6v6H4zM14 4h6v6h-6zM4 14h6v6H4zM14 14h2v2h-2zM18 14h2v2h-2zM14 18h2v2h-2zM18 18h2v2h-2z"/></svg><span>Pay</span></button>
+  <button data-tab="refresh"><svg viewBox="0 0 24 24"><path d="M20 12a8 8 0 1 1-2.6-5.9M20 4v5h-5"/></svg><span>Refresh</span></button>
+  <button data-tab="history"><svg viewBox="0 0 24 24"><path d="M5 6h14M5 12h14M5 18h9"/></svg><span>History</span></button>
+</nav>
+
+<div id="sheet" hidden>
+  <div id="sheet-back" data-act="closeSheet"></div>
+  <section id="sheet-body" role="dialog" aria-modal="true"></section>
+</div>
+<div id="toast" role="status" hidden></div>
+
+<script src="jsqr.js"></script>
+<script src="app.js"></script>
+</body>
+</html>
